@@ -1,0 +1,501 @@
+(function(){
+  const C = {
+    Food:"#A6432B", Transport:"#A9782F", Shopping:"#556B4F",
+    Entertainment:"#6B4E8E", Utilities:"#2F6B6E", Health:"#8E3B5C", Other:"#5B6653"
+  };
+  const CATEGORY_KEYWORDS = {
+    Food: ["pizza","restaurant","burger","dinner","lunch","breakfast","swiggy","zomato","food","cafe","coffee","snack","meal","dominos","bakery"],
+    Transport: ["uber","ola","bus","train","metro","taxi","fuel","petrol","diesel","cab","ride","auto","flight","toll"],
+    Shopping: ["amazon","flipkart","shirt","shoes","shopping","mall","myntra","clothes","sneakers","order","sale"],
+    Entertainment: ["movie","netflix","spotify","game","concert","bookmyshow","cinema","show","subscription"],
+    Utilities: ["electricity","bill","wifi","recharge","water","gas","rent","broadband","utility","maintenance"],
+    Health: ["medicine","doctor","hospital","pharmacy","gym","clinic","health","insurance"]
+  };
+  const CATEGORIES = [...Object.keys(CATEGORY_KEYWORDS), "Other"];
+  const DEFAULT_BUDGETS = {Food:5000,Transport:3000,Shopping:4000,Entertainment:2000,Utilities:3000,Health:2000,Other:1500};
+  const STORAGE_KEY = "smart-expense-tracker-data";
+  const CURRENT_MONTH = "2026-08";
+  const DAY_OF_MONTH = 30, DAYS_IN_MONTH = 31;
+
+  function categorize(desc){
+    const words = desc.toLowerCase().split(/[^a-z]+/).filter(Boolean);
+    
+    // Check learned corrections first (highest priority)
+    for(const word of words){
+      if(categoryCorrections[word]){
+        return {category: categoryCorrections[word], confidence: 0.95, learned: true};
+      }
+    }
+    
+    // Use keyword matching if no learned correction found
+    let best="Other", bestScore=0;
+    for(const [cat,kws] of Object.entries(CATEGORY_KEYWORDS)){
+      const score = words.filter(w=>kws.includes(w)).length;
+      if(score>bestScore){bestScore=score;best=cat;}
+    }
+    const confidence = bestScore===0 ? 0.4 : Math.min(0.98, 0.6+bestScore*0.18);
+    return {category:best, confidence};
+  }
+
+  function inr(n){ return "₹"+Math.round(n).toLocaleString("en-IN"); }
+  function monthKey(d){ return d.slice(0,7); }
+  function monthLabel(key){
+    const [y,m]=key.split("-").map(Number);
+    return new Date(y,m-1,1).toLocaleString("en-IN",{month:"short",year:"2-digit"});
+  }
+
+  function buildSeed(){
+    const rows = [
+      ["2026-04-03",380,"Lunch at cafe","UPI"],["2026-04-08",220,"Coffee with friend","UPI"],
+      ["2026-04-11",650,"Uber to airport","Card"],["2026-04-15",1450,"Amazon order shoes","Card"],
+      ["2026-04-19",300,"Dinner restaurant","UPI"],["2026-04-22",1200,"Electricity bill","Netbanking"],
+      ["2026-04-27",500,"Netflix + Spotify","Card"],
+      ["2026-05-02",420,"Swiggy dinner","UPI"],["2026-05-06",700,"Ola cab","UPI"],
+      ["2026-05-10",1600,"Flipkart shirt order","Card"],["2026-05-14",350,"Breakfast cafe","UPI"],
+      ["2026-05-18",1300,"Electricity bill","Netbanking"],["2026-05-23",480,"Movie tickets","Card"],
+      ["2026-05-28",260,"Pharmacy","UPI"],
+      ["2026-06-02",500,"Zomato order","UPI"],["2026-06-07",800,"Uber rides","UPI"],
+      ["2026-06-12",1700,"Amazon shopping","Card"],["2026-06-16",300,"Coffee","UPI"],
+      ["2026-06-20",1350,"Electricity + wifi bill","Netbanking"],["2026-06-25",550,"Gym membership","Card"],
+      ["2026-06-29",400,"Restaurant dinner","UPI"],
+      ["2026-07-03",480,"Pizza night","UPI"],["2026-07-08",900,"Ola to college","UPI"],
+      ["2026-07-12",1900,"Myntra order","Card"],["2026-07-16",320,"Cafe breakfast","UPI"],
+      ["2026-07-21",1400,"Electricity bill","Netbanking"],["2026-07-25",600,"Bookmyshow tickets","Card"],
+      ["2026-07-29",350,"Doctor visit","UPI"],
+      ["2026-08-02",450,"Swiggy dinner","UPI"],["2026-08-05",850,"Uber rides","UPI"],
+      ["2026-08-09",2000,"Amazon order","Card"],["2026-08-12",300,"Coffee with team","UPI"],
+      ["2026-08-15",1450,"Electricity bill","Netbanking"],
+      ["2026-08-18",3800,"Anniversary dinner restaurant","Card"],
+      ["2026-08-24",400,"Gym + protein","UPI"]
+    ];
+    return rows.map(([date,amount,description,paymentMethod],i)=>{
+      const {category} = categorize(description);
+      return {id:"seed-"+i, date, amount, description, category, paymentMethod};
+    });
+  }
+
+  async function trainAndPredict(monthlyTotals){
+    if(monthlyTotals.length<2 || typeof tf==="undefined") return null;
+    const xs = tf.tensor2d(monthlyTotals.map((_,i)=>[i+1]));
+    const ys = tf.tensor2d(monthlyTotals.map(v=>[v]));
+    const model = tf.sequential();
+    model.add(tf.layers.dense({units:10, activation:"relu", inputShape:[1]}));
+    model.add(tf.layers.dense({units:1}));
+    model.compile({optimizer:tf.train.adam(0.05), loss:"meanSquaredError"});
+    await model.fit(xs, ys, {epochs:200, verbose:0});
+    const predTensor = model.predict(tf.tensor2d([[monthlyTotals.length+1]]));
+    const data = await predTensor.data();
+    xs.dispose(); ys.dispose(); predTensor.dispose(); model.dispose();
+    return data[0];
+  }
+
+  /* ---------------- state ---------------- */
+  let state = { expenses: null, budgets: DEFAULT_BUDGETS, income: 30000 };
+  let form = { desc:"", amount:"", payment:"UPI", date:new Date().toISOString().slice(0,10), category:"" };
+  let flash = null;
+  let predictedTotal = null, predicting = false;
+  let saving = false;
+  let categoryCorrections = {}; // Stores learned category corrections from user manual selections
+
+  async function load(){
+    try{
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if(saved){
+        const data = JSON.parse(saved);
+        state.expenses = data.expenses || [];
+        state.budgets = data.budgets || DEFAULT_BUDGETS;
+        state.income = data.income ?? 30000;
+      } else {
+        state.expenses = buildSeed();
+      }
+      // Load AI learning corrections
+      const corrections = localStorage.getItem(STORAGE_KEY + "-corrections");
+      if(corrections) {
+        categoryCorrections = JSON.parse(corrections);
+      }
+    }catch(e){
+      state.expenses = buildSeed();
+    }
+    document.getElementById("set-loading").style.display="none";
+    document.getElementById("set-app").style.display="block";
+    render();
+    runPrediction();
+  }
+
+  async function persist(){
+    saving = true; renderSavedBadge();
+    try{
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        expenses: state.expenses, budgets: state.budgets, income: state.income
+      }));
+    }catch(e){}
+    saving = false; renderSavedBadge();
+  }
+
+  function renderSavedBadge(){
+    const el = document.getElementById("set-saved-badge");
+    if(el) el.textContent = (saving ? "Saving… · " : "Saved · ") + "August 2026";
+  }
+
+  /* ---------------- derived data ---------------- */
+  function computeDerived(){
+    const byMonth = {};
+    for(const e of state.expenses){
+      const k = monthKey(e.date);
+      (byMonth[k] = byMonth[k]||[]).push(e);
+    }
+    const monthKeysSorted = Object.keys(byMonth).sort();
+    const monthlyTotals = monthKeysSorted.map(k=>byMonth[k].reduce((s,e)=>s+e.amount,0));
+    const chartData = monthKeysSorted.map((k,i)=>({month:monthLabel(k), total:monthlyTotals[i]}));
+
+    const categoryTotalsThisMonth = {};
+    CATEGORIES.forEach(c=>categoryTotalsThisMonth[c]=0);
+    (byMonth[CURRENT_MONTH]||[]).forEach(e=>{ categoryTotalsThisMonth[e.category]=(categoryTotalsThisMonth[e.category]||0)+e.amount; });
+
+    const totalThisMonth = Object.values(categoryTotalsThisMonth).reduce((s,v)=>s+v,0);
+
+    const monthIdx = monthKeysSorted.indexOf(CURRENT_MONTH);
+    const prevMonthKey = monthIdx>0 ? monthKeysSorted[monthIdx-1] : null;
+    let trendInsights = [];
+    if(prevMonthKey){
+      const prevTotals = {};
+      (byMonth[prevMonthKey]||[]).forEach(e=>{ prevTotals[e.category]=(prevTotals[e.category]||0)+e.amount; });
+      Object.entries(categoryTotalsThisMonth).forEach(([cat,cur])=>{
+        const prev = prevTotals[cat]||0;
+        if(prev>200 && cur>0){
+          const pct = ((cur-prev)/prev)*100;
+          if(Math.abs(pct)>=15) trendInsights.push({cat,pct});
+        }
+      });
+      trendInsights.sort((a,b)=>Math.abs(b.pct)-Math.abs(a.pct));
+      trendInsights = trendInsights.slice(0,3);
+    }
+
+    const anomalies = [];
+    for(const cat of Object.keys(CATEGORY_KEYWORDS)){
+      const history = state.expenses.filter(e=>e.category===cat && monthKey(e.date)!==CURRENT_MONTH).map(e=>e.amount);
+      if(history.length<3) continue;
+      const mean = history.reduce((s,v)=>s+v,0)/history.length;
+      const variance = history.reduce((s,v)=>s+(v-mean)**2,0)/history.length;
+      const std = Math.sqrt(variance);
+      (byMonth[CURRENT_MONTH]||[]).filter(e=>e.category===cat).forEach(e=>{
+        if(std>0 && e.amount > mean+2*std) anomalies.push({...e, mean, std});
+      });
+    }
+
+    const budgetPace = Object.entries(categoryTotalsThisMonth)
+      .filter(([,v])=>v>0)
+      .map(([cat,v])=>{
+        const projected = (v/DAY_OF_MONTH)*DAYS_IN_MONTH;
+        const budget = state.budgets[cat]||0;
+        return {cat, projected, budget, over: budget>0 && projected>budget};
+      })
+      .filter(r=>r.over);
+
+    const recentEntries = state.expenses.slice()
+      .sort((a,b)=> b.date.localeCompare(a.date) || String(b.id).localeCompare(String(a.id)))
+      .slice(0,10);
+
+    return {byMonth, monthKeysSorted, monthlyTotals, chartData, categoryTotalsThisMonth,
+            totalThisMonth, trendInsights, anomalies, budgetPace, recentEntries};
+  }
+
+  async function runPrediction(){
+    const d = computeDerived();
+    if(d.monthlyTotals.length<2) return;
+    predicting = true; renderInsights();
+    try{
+      predictedTotal = await trainAndPredict(d.monthlyTotals);
+    }catch(e){ predictedTotal = null; }
+    predicting = false; renderInsights();
+  }
+
+  /* ---------------- actions ---------------- */
+  function addExpense(){
+    const amt = parseFloat(form.amount);
+    if(!form.desc.trim() || !amt || amt<=0) return;
+    
+    let category, confidence;
+    let manualCategoryUsed = false;
+    
+    // Use manual selection if user provided one, otherwise use AI
+    if(form.category && form.category !== ""){
+      category = form.category;
+      confidence = 1.0; // Full confidence for manual selection
+      manualCategoryUsed = true;
+    } else {
+      ({category, confidence} = categorize(form.desc));
+    }
+    
+    // Learn from correction: if user manually selected category different from AI, store it
+    if(manualCategoryUsed){
+      const aiPred = categorize(form.desc);
+      if(aiPred.category !== category){
+        // Store first word as key for future learning
+        const firstWord = form.desc.toLowerCase().split(/[^a-z]+/).filter(Boolean)[0];
+        if(firstWord){
+          categoryCorrections[firstWord] = category;
+          localStorage.setItem(STORAGE_KEY + "-corrections", JSON.stringify(categoryCorrections));
+        }
+      }
+    }
+    
+    const entry = {id:"e-"+Date.now(), date:form.date, amount:amt, description:form.desc.trim(), category, paymentMethod:form.payment, confidence};
+
+    const history = state.expenses.filter(e=>e.category===category).map(e=>e.amount);
+    let flashMsg;
+    if(history.length>=3){
+      const mean = history.reduce((s,v)=>s+v,0)/history.length;
+      const std = Math.sqrt(history.reduce((s,v)=>s+(v-mean)**2,0)/history.length);
+      if(std>0 && amt > mean+2*std){
+        flashMsg = {type:"anomaly", text:`Unusual ${category} expense detected — ${inr(amt)} is well above your normal ${inr(mean)} range.`};
+      }
+    }
+    if(!flashMsg) flashMsg = {type:"ok", text:`Logged as ${category} (${Math.round(confidence*100)}% confidence).`};
+
+    state.expenses.push(entry);
+    flash = flashMsg;
+    form.desc=""; form.amount=""; form.category="";
+    persist();
+    render();
+    runPrediction();
+    setTimeout(()=>{ flash=null; renderFlash(); }, 4500);
+  }
+
+  function deleteExpense(id){
+    state.expenses = state.expenses.filter(e=>e.id!==id);
+    persist();
+    render();
+    runPrediction();
+  }
+
+  function updateBudget(cat, val){
+    state.budgets = {...state.budgets, [cat]: Math.max(0, parseFloat(val)||0)};
+    persist();
+  }
+
+  function updateIncome(newIncome){
+    state.income = Math.max(0, newIncome);
+    persist();
+    render();
+    runPrediction();
+  }
+
+  /* ---------------- rendering ---------------- */
+  function icon(name, size, color){
+    const s = size||14, col = color||"currentColor";
+    const paths = {
+      wallet:'<path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4Z"/>',
+      trend:'<polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/>',
+      stamp:'<path d="M5 22h14"/><path d="M19 15v-3a4 4 0 0 0-4-4h-1V5a2 2 0 0 0-4 0v3H9a4 4 0 0 0-4 4v3"/><path d="M5 15h14v3a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2Z"/>',
+      sparkle:'<path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1"/>',
+      alert:'<path d="m21.73 18-8-14a2 2 0 0 0-3.46 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+      plus:'<circle cx="12" cy="12" r="10"/><path d="M8 12h8M12 8v8"/>',
+      trash:'<path d="M3 6h18"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>'
+    };
+    return `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="${col}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${paths[name]||""}</svg>`;
+  }
+
+  function lineChartSVG(chartData){
+    const w=800, h=200, padL=36, padR=10, padT=10, padB=26;
+    if(chartData.length===0) return "";
+    const max = Math.max(...chartData.map(d=>d.total)) * 1.15 || 1;
+    const min = 0;
+    const stepX = chartData.length>1 ? (w-padL-padR)/(chartData.length-1) : 0;
+    const x = i => padL + stepX*i;
+    const y = v => padT + (h-padT-padB) * (1 - (v-min)/(max-min || 1));
+    const points = chartData.map((d,i)=>`${x(i)},${y(d.total)}`).join(" ");
+    const gridY = [0,0.25,0.5,0.75,1].map(f=>padT+(h-padT-padB)*f);
+    let svg = `<svg viewBox="0 0 ${w} ${h}" style="width:100%;height:200px;">`;
+    gridY.forEach(gy=> svg += `<line x1="${padL}" y1="${gy}" x2="${w-padR}" y2="${gy}" stroke="var(--line)" stroke-dasharray="3 3"/>`);
+    svg += `<polyline points="${points}" fill="none" stroke="var(--brass)" stroke-width="2.5"/>`;
+    chartData.forEach((d,i)=>{
+      svg += `<circle cx="${x(i)}" cy="${y(d.total)}" r="4" fill="var(--brass)"/>`;
+      svg += `<text x="${x(i)}" y="${h-8}" font-size="11" fill="var(--ink-soft)" text-anchor="middle" font-family="Inter,sans-serif">${d.month}</text>`;
+    });
+    svg += `</svg>`;
+    return svg;
+  }
+
+  function renderFlash(){
+    const el = document.getElementById("set-flash-zone");
+    if(!el) return;
+    if(!flash){ el.innerHTML=""; return; }
+    el.innerHTML = `<div class="set-flash ${flash.type}">${icon(flash.type==="anomaly"?"alert":"sparkle",15)} ${flash.text}</div>`;
+  }
+
+  function renderInsights(){
+    const el = document.getElementById("set-insights-zone");
+    if(!el) return;
+    const d = computeDerived();
+    let rows = [];
+
+    if(predicting){
+      rows.push(`<div class="set-insight">${icon("trend",14)}<span>Training the prediction model on your monthly history…</span></div>`);
+    } else if(predictedTotal){
+      rows.push(`<div class="set-insight">${icon("trend",14)}<span>Predicted spend next month: <b class="mono">${inr(predictedTotal)}</b> (TensorFlow.js regression over ${d.monthlyTotals.length} months of history)</span></div>`);
+    } else {
+      rows.push(`<div class="set-insight">${icon("trend",14)}<span>Add a couple more months of data to unlock next-month predictions.</span></div>`);
+    }
+
+    d.trendInsights.forEach(t=>{
+      const tone = t.pct>0 ? "var(--rust)" : "var(--sage)";
+      rows.push(`<div class="set-insight" style="color:${tone}">${icon("trend",14,tone)}<span>${t.cat} spending is ${t.pct>0?"up":"down"} <b>${Math.abs(Math.round(t.pct))}%</b> vs last month.</span></div>`);
+    });
+
+    d.budgetPace.forEach(b=>{
+      rows.push(`<div class="set-insight" style="color:var(--rust)">${icon("alert",14,"var(--rust)")}<span>${b.cat} is on pace for <b class="mono">${inr(b.projected)}</b> this month — over your ${inr(b.budget)} budget.</span></div>`);
+    });
+
+    d.anomalies.forEach(a=>{
+      rows.push(`<div class="set-insight" style="color:var(--rust)">${icon("alert",14,"var(--rust)")}<span>Unusual ${a.category} entry "${a.description}" — <b class="mono">${inr(a.amount)}</b> vs your normal ~${inr(a.mean)}.</span></div>`);
+    });
+
+    if(d.trendInsights.length===0 && d.budgetPace.length===0 && d.anomalies.length===0 && !predicting){
+      rows.push(`<div class="set-insight" style="color:var(--sage)">${icon("sparkle",14,"var(--sage)")}<span>Everything looks steady this month — no unusual patterns.</span></div>`);
+    }
+
+    el.innerHTML = rows.join("");
+  }
+
+  function render(){
+    const d = computeDerived();
+    const app = document.getElementById("set-app");
+
+    const statsHTML = `
+      <div class="set-stats">
+        <div class="set-stat">
+          <div class="set-stat-label">${icon("wallet",15)} Monthly Income</div>
+          <div style="display:flex;align-items:center;gap:8px;margin-top:6px;">
+            <span class="set-stat-value mono">₹</span>
+            <input type="number" id="set-income-input" class="set-input mono" style="font-size:18px;font-weight:700;width:160px;padding:6px 8px;" value="${state.income}">
+          </div>
+        </div>
+        <div class="set-stat"><div class="set-stat-label">${icon("trend",15)} Spent this month</div><div class="set-stat-value mono">${inr(d.totalThisMonth)}</div></div>
+        <div class="set-stat"><div class="set-stat-label">${icon("stamp",15)} Balance</div><div class="set-stat-value mono" style="color:${state.income-d.totalThisMonth<0?'var(--rust)':'var(--sage)'}">${inr(state.income-d.totalThisMonth)}</div></div>
+      </div>`;
+
+    const budgetsHTML = Object.keys(state.budgets).filter(c=>c!=="Other"||d.categoryTotalsThisMonth.Other>0).map(cat=>{
+      const spent = d.categoryTotalsThisMonth[cat]||0;
+      const budget = state.budgets[cat]||1;
+      const pct = Math.min(100,(spent/budget)*100);
+      const over = spent>budget;
+      return `<div class="set-budget-row">
+        <div class="set-budget-top">
+          <span class="set-budget-name"><span class="set-dot" style="background:${C[cat]}"></span>${cat}</span>
+          <span class="mono">${inr(spent)} / <input class="set-budget-input mono" data-cat="${cat}" value="${budget}"></span>
+        </div>
+        <div class="set-budget-bar"><div class="set-budget-fill" style="width:${pct}%;background:${over?'var(--rust)':'var(--sage)'}"></div></div>
+      </div>`;
+    }).join("");
+
+    const tableRowsHTML = d.recentEntries.map(e=>`
+      <div class="set-table-row">
+        <span class="mono" style="font-size:11.5px;color:var(--ink-soft)">${e.date.slice(5)}</span>
+        <span>${e.description}</span>
+        <span><span class="set-cat-pill" style="background:${C[e.category]}22;color:${C[e.category]}">${e.category}</span></span>
+        <span class="mono" style="text-align:right">${inr(e.amount)}</span>
+        <button class="set-del-btn" data-del="${e.id}">${icon("trash",14)}</button>
+      </div>`).join("");
+
+    app.innerHTML = `
+      <header style="margin-bottom:22px;">
+        <div class="set-header-row">
+          <h1 class="serif set-title">Smart Ledger</h1>
+          <span class="mono set-sub" id="set-saved-badge">Saved · August 2026</span>
+        </div>
+        <div class="set-rule"></div>
+        ${statsHTML}
+      </header>
+
+      <div id="set-flash-zone"></div>
+
+      <section class="set-card">
+        <h2 class="serif">${icon("sparkle",16,"var(--brass)")} AI Insights</h2>
+        <div id="set-insights-zone"></div>
+      </section>
+
+      <section class="set-card">
+        <h2 class="serif">${icon("plus",16,"var(--brass)")} New Ledger Entry</h2>
+        <div class="set-form-grid">
+          <div class="set-field"><label>Description</label><input id="set-desc" class="set-input" placeholder="e.g. Uber ride to college" value="${form.desc}"></div>
+          <div class="set-field"><label>Amount (₹)</label><input id="set-amount" class="set-input mono" type="number" min="0" placeholder="0" value="${form.amount}"></div>
+          <div class="set-field"><label>Category</label>
+            <select id="set-category" class="set-input">
+              <option value="">AI will detect</option>
+              ${CATEGORIES.map(cat=>`<option ${form.category===cat?"selected":""}>${cat}</option>`).join("")}
+            </select>
+          </div>
+          <div class="set-field"><label>Payment</label>
+            <select id="set-payment" class="set-input">
+              ${["UPI","Card","Cash","Netbanking"].map(p=>`<option ${form.payment===p?"selected":""}>${p}</option>`).join("")}
+            </select>
+          </div>
+          <button class="set-btn" id="set-add-btn">${icon("plus",15)} Add</button>
+        </div>
+        <div class="set-form-footer">
+          <input type="date" id="set-date" class="set-input mono" style="width:150px;padding:6px 8px;" value="${form.date}">
+          <span class="set-preview" id="set-preview"></span>
+        </div>
+      </section>
+
+      <section class="set-card">
+        <h2 class="serif">${icon("wallet",16,"var(--brass)")} Budgets</h2>
+        ${budgetsHTML}
+      </section>
+
+      <section class="set-card">
+        <h2 class="serif">${icon("stamp",16,"var(--brass)")} Recent Entries</h2>
+        <div class="set-table-head"><span>Date</span><span>Description</span><span>Category</span><span style="text-align:right">Amount</span><span></span></div>
+        ${tableRowsHTML}
+      </section>
+
+      <p class="set-foot">Demo data is seeded for Apr–Aug 2026. All figures are stored to your account via this artifact's storage — nothing leaves this page.</p>
+    `;
+
+    bindEvents();
+    renderInsights();
+    renderFlash();
+  }
+
+  function updatePreview(){
+    const el = document.getElementById("set-preview");
+    if(!el) return;
+    if(form.desc.trim().length>2){
+      const {category,confidence} = categorize(form.desc);
+      el.innerHTML = `<span class="set-dot" style="background:${C[category]}"></span> Will be tagged <b style="color:var(--ink)">${category}</b> · ${Math.round(confidence*100)}% confidence`;
+    } else {
+      el.innerHTML = "";
+    }
+  }
+
+  function bindEvents(){
+    const descEl = document.getElementById("set-desc");
+    const amtEl = document.getElementById("set-amount");
+    const catEl = document.getElementById("set-category");
+    const payEl = document.getElementById("set-payment");
+    const dateEl = document.getElementById("set-date");
+    const incomeEl = document.getElementById("set-income-input");
+    const addBtn = document.getElementById("set-add-btn");
+
+    descEl.addEventListener("input", e=>{ form.desc=e.target.value; updatePreview(); });
+    amtEl.addEventListener("input", e=>{ form.amount=e.target.value; });
+    catEl.addEventListener("change", e=>{ form.category=e.target.value; });
+    payEl.addEventListener("change", e=>{ form.payment=e.target.value; });
+    dateEl.addEventListener("change", e=>{ form.date=e.target.value; });
+    if(incomeEl){
+      incomeEl.addEventListener("change", e=>{ updateIncome(parseFloat(e.target.value)||0); });
+    }
+    addBtn.addEventListener("click", addExpense);
+
+    document.querySelectorAll(".set-del-btn").forEach(btn=>{
+      btn.addEventListener("click", ()=> deleteExpense(btn.getAttribute("data-del")));
+    });
+    document.querySelectorAll(".set-budget-input").forEach(inp=>{
+      inp.addEventListener("change", ()=> updateBudget(inp.getAttribute("data-cat"), inp.value));
+    });
+    updatePreview();
+  }
+
+  load();
+})();
